@@ -1,4 +1,4 @@
-"""Generic ESP32 320x240
+"""Generic ESP32 172x320
 
 """
 
