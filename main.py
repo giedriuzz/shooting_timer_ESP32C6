@@ -8,6 +8,13 @@ Uses Boot Button (Pin 0) and Select Button (Pin 5) for menu navigation and contr
 import machine
 from machine import Pin, PWM
 
+# Note: For ESP32-C3/C6, esp32 module might not have wake_on_ext0. 
+# We will use machine.Pin(..., wake=machine.Pin.WAKE_LOW) if so.
+try:
+    WAKE_LOW_FLAG = machine.Pin.WAKE_LOW
+except:
+    WAKE_LOW_FLAG = None
+
 if hasattr(machine, 'I2S'):
     from machine import I2S
     HAS_I2S = True
@@ -26,7 +33,7 @@ import vga2_bold_16x32 as font
 BTN_SCROLL_PIN = 0  # Button 1 for SCROLL/NEXT/INCREMENT
 BTN_SELECT_PIN = 5  # Button 2 for SELECT/START/STOP
 BACKLIGHT_PIN = 22
-BUZZER_PIN = 32     # Moved from 5 to 32 to free up Button 2
+BUZZER_PIN = 9      # User requested Pin 9
 
 # I2S Microphone Setup
 I2S_SCK_PIN = 2
@@ -50,6 +57,8 @@ settings = {
     "mode": 0,                 # 0 = Live Fire, 1 = Dry Fire
     "sensitivity": 800000,     # Acoustic threshold
     "buzzer_vol": 50,          # 0-100% volume
+    "theme": 0,                # 0 = Dark, 1 = Light
+    "sleep_time": 5,           # Inactivity timeout to Deep Sleep (minutes, 0 = Off)
 }
 
 def get_energy_threshold():
@@ -59,19 +68,39 @@ def get_energy_threshold():
         return 10000 # Very sensitive for dry fire clicks
     return settings["sensitivity"]
 
-# Colors
+# Colors (Fallback/Constants if needed, but using functions dynamically below)
 COLOR_BG = st7789.BLACK
 COLOR_TEXT = st7789.WHITE
-COLOR_ACCENT = st7789.RED
-COLOR_READY = st7789.YELLOW
-COLOR_GO = st7789.GREEN
-COLOR_SEL = st7789.CYAN
+
+# Dynamic Theme Colors
+def get_bg_color():
+    return st7789.WHITE if settings["theme"] == 1 else st7789.BLACK
+
+def get_text_color():
+    return st7789.BLACK if settings["theme"] == 1 else st7789.WHITE
+    
+def get_accent_color():
+    # Red for both themes (contrast is fine on both black and white)
+    return st7789.RED
+
+def get_ready_color():
+    # Yellow on black, Blue on white
+    return st7789.BLUE if settings["theme"] == 1 else st7789.YELLOW
+    
+def get_go_color():
+    # Green on black, Dark Green on white (RGB565: 0x03E0)
+    return 0x03E0 if settings["theme"] == 1 else st7789.GREEN
+    
+def get_sel_color():
+    # Cyan on black, Blue on white
+    return st7789.BLUE if settings["theme"] == 1 else st7789.CYAN
 
 # Globals
 app_state = "BOOT"
 menu_idx = 0
 current_menu = "MAIN"
 shot_history = []
+last_activity_time = ticks_ms()
 
 tft = None
 btn_scroll = None
@@ -90,7 +119,7 @@ except: pass
 try:
     tft = tft_config.config(tft_config.WIDE)
     tft.rotation(1)
-    tft.fill(COLOR_BG)
+    tft.fill(get_bg_color())
 except Exception as e:
     print(f"TFT Init Failed: {e}")
 
@@ -107,8 +136,8 @@ except Exception as e:
     print(f"Button Init Failed: {e}")
 
 try:
-    buzzer = PWM(Pin(BUZZER_PIN))
-    buzzer.duty_u16(0)
+    buzzer = Pin(BUZZER_PIN, Pin.OUT)
+    buzzer.value(1) # Idle HIGH (OFF) for PNP transistor
     print("Buzzer init OK")
 except:
     buzzer = None
@@ -128,18 +157,63 @@ if HAS_I2S:
 
 # --- Helper Functions ---
 def clear_screen():
-    if tft: tft.fill(COLOR_BG)
+    if tft: tft.fill(get_bg_color())
 
-def draw_text(text, x, y, color=COLOR_TEXT):
-    if tft: tft.text(font, text, x, y, color, COLOR_BG)
+def draw_text(text, x, y, color=None):
+    if color is None:
+        color = get_text_color()
+    if tft: tft.text(font, text, x, y, color, get_bg_color())
 
-def beep(duration_ms=200, freq=3000):
+def beep(duration_ms=200):
     if buzzer and settings["buzzer_vol"] > 0:
-        duty = int((settings["buzzer_vol"] / 100) * 65535)
-        buzzer.freq(freq)
-        buzzer.duty_u16(duty)
+        # Active buzzer with PNP transistor:
+        # LOW (0) turns the transistor ON, HIGH (1) turns it OFF.
+        # We ignore variable volume for active buzzers, just turn it on.
+        buzzer.value(0) # Turn ON
         sleep(duration_ms / 1000)
-        buzzer.duty_u16(0)
+        buzzer.value(1) # Turn OFF
+
+def enter_deep_sleep():
+    global tft, backlight_pwm
+    clear_screen()
+    draw_text("SLEEPING...", 80, 100, get_accent_color())
+    for _ in range(3):
+        beep(100)
+        sleep(0.1)
+    sleep(0.5)
+    
+    # Turn off backlight and screen
+    if tft: tft.fill(st7789.BLACK)
+    try:
+        backlight_pwm.duty_u16(0)
+    except: pass
+    
+    # Configure wake up from Select Button (Pin 5) pulling LOW
+    wake_pin = Pin(BTN_SELECT_PIN, Pin.IN, Pin.PULL_UP)
+    
+    # Generic machine API (ESP32-C3, ESP32-C6, etc)
+    if WAKE_LOW_FLAG is not None:
+         wake_pin.irq(handler=lambda t: None, trigger=Pin.IRQ_FALLING, wake=machine.SLEEP)
+            
+    # Enter Light Sleep (behaves like deep sleep on C6 but wakes cleanly from GPIO)
+    machine.lightsleep()
+    
+    # Disable the IRQ immediately so it doesn't fire repeatedly
+    if WAKE_LOW_FLAG is not None:
+         wake_pin.irq(handler=None, wake=0)
+    # When we wake up, restore display color and backlight
+    if tft:
+        try:
+            tft.fill(get_bg_color())
+        except Exception as e:
+            print("Wake TFT error:", e)
+
+    try:
+        backlight_pwm = PWM(Pin(BACKLIGHT_PIN))
+        backlight_pwm.freq(1000)
+        backlight_pwm.duty_u16(settings["brightness"])
+    except Exception as e:
+        print("Wake PWM error:", e)
 
 def get_button_action():
     """
@@ -149,13 +223,17 @@ def get_button_action():
     2 = Select (Short Press Btn 2)
     3 = Back/Long Select (Long Press Btn 2)
     """
+    global last_activity_time
+    
     if btn_scroll.value() == 0:
+        last_activity_time = ticks_ms()
         sleep(0.05) # Debounce
         if btn_scroll.value() == 0:
             while btn_scroll.value() == 0: pass # Wait release
             return 1
             
     if btn_select.value() == 0:
+        last_activity_time = ticks_ms()
         sleep(0.05) # Debounce
         if btn_select.value() == 0:
             start_t = ticks_ms()
@@ -172,7 +250,7 @@ MAIN_MENU = ["START", "Settings"]
 SETTINGS_MENU = ["Setup", "Calibrate", "System", "<- Back"]
 SETUP_MENU = ["Delay Min", "Delay Max", "Par Time", "Par Reps", "Par Rest", "Par Shots", "Mode", "<- Back"]
 CALIB_MENU = ["Sensitivity", "Buzzer Vol", "<- Back"]
-SYS_MENU = ["Brightness", "<- Back"]
+SYS_MENU = ["Brightness", "Theme", "Sleep Time", "<- Back"]
 
 def draw_menu(items, selected_idx):
     clear_screen()
@@ -191,7 +269,7 @@ def draw_menu(items, selected_idx):
         SETTINGS_Y = 100
         
         for i, text in enumerate(items):
-            color = COLOR_SEL if i == selected_idx else COLOR_TEXT
+            color = get_sel_color() if i == selected_idx else get_text_color()
             prefix = ">" if i == selected_idx else " "
             
             if text == "START":
@@ -200,7 +278,7 @@ def draw_menu(items, selected_idx):
                 draw_text(f"{prefix}{text}", SETTINGS_X, SETTINGS_Y, color)
 
         if settings["par_time"] > 0:
-            draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 205, COLOR_READY)
+            draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 205, get_ready_color())
             
         return # Main menu drawn, skip generic drawing
     
@@ -220,7 +298,7 @@ def draw_menu(items, selected_idx):
         end_idx = len(items)
 
     for i in range(start_idx, end_idx):
-        color = COLOR_SEL if i == selected_idx else COLOR_TEXT
+        color = get_sel_color() if i == selected_idx else get_text_color()
         prefix = ">" if i == selected_idx else " "
         
         text = items[i]
@@ -236,24 +314,29 @@ def draw_menu(items, selected_idx):
             text = f"Sens: {mapped_val}"
         elif text == "Buzzer Vol": text = f"Buzz: {settings['buzzer_vol']}%"
         elif text == "Brightness": text = f"Bright:{int(settings['brightness']/65535*100)}%"
+        elif text == "Theme": text = f"Theme:{'Light' if settings['theme'] == 1 else 'Dark'}"
+        elif text == "Sleep Time": text = f"Sleep:{settings['sleep_time']}m" if settings['sleep_time'] > 0 else "Sleep:Off"
         
         draw_text(f"{prefix}{text}", x_offset, y, color)
         y += y_step
 
     if is_main and settings["par_time"] > 0:
-        draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 205, COLOR_READY)
+        draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 205, get_ready_color())
 
 # --- State Machine App ---
 def main():
-    global app_state, menu_idx, current_menu, shot_history
+    global app_state, menu_idx, current_menu, shot_history, last_activity_time
     
+    last_activity_time = ticks_ms()
+
     # Boot Sequence
     clear_screen()
-    draw_text("G electronic", 70, 70, COLOR_ACCENT) # [ ] Sureguliuoti užrašo G-electronic lygiavimą
+    draw_text("G electronic", 70, 70, get_accent_color()) # [ ] Sureguliuoti užrašo G-electronic lygiavimą
     sleep(3)
     clear_screen()
-    draw_text("Shooting timer", 50, 70, COLOR_READY) # [ ] Sureguliuoti užrašo "Shooting timer" lygiavimą
+    draw_text("Shooting timer", 50, 70, get_ready_color()) # [ ] Sureguliuoti užrašo "Shooting timer" lygiavimą
     sleep(2)
+    beep(100)
     
     app_state = "MENU"
     menu_idx = 0
@@ -270,6 +353,20 @@ def main():
             draw_menu(menu_list, menu_idx)
             
             while app_state == "MENU":
+                # Check for inactivity Deep Sleep if enabled
+                if settings["sleep_time"] > 0:
+                    sleep_ms = settings["sleep_time"] * 60 * 1000
+                    if ticks_diff(ticks_ms(), last_activity_time) >= sleep_ms:
+                        enter_deep_sleep()
+                        
+                        # Truly woke up. Wait for them to release the button if they were holding it
+                        while btn_select.value() == 0:
+                            sleep(0.05)
+                            
+                        # Show menu again
+                        last_activity_time = ticks_ms()
+                        draw_menu(menu_list, menu_idx)
+                    
                 act = get_button_action()
                 if act == 1: # SCROLL
                     menu_idx = (menu_idx + 1) % len(menu_list)
@@ -334,6 +431,16 @@ def main():
                             try:
                                 backlight_pwm.duty_u16(settings["brightness"])
                             except: pass
+                        elif "Theme" in selectedSTR:
+                            settings["theme"] = 1 if settings["theme"] == 0 else 0
+                        elif "Sleep Time" in selectedSTR:
+                            # 0 (Off), 1, 2, 5, 10, 15, 30
+                            times = [0, 1, 2, 5, 10, 15, 30]
+                            try:
+                                curr_idx = times.index(settings["sleep_time"])
+                            except:
+                                curr_idx = 3 # default 5
+                            settings["sleep_time"] = times[(curr_idx + 1) % len(times)]
                             
                     if app_state == "MENU": # Redraw menu after changes
                         if current_menu == "MAIN": menu_list = MAIN_MENU
@@ -347,7 +454,7 @@ def main():
 
         elif app_state == "STANDBY":
             clear_screen()
-            draw_text("STANDBY...", 80, 100, COLOR_READY)
+            draw_text("STANDBY...", 80, 100, get_ready_color())
             
             d_min = min(settings["delay_min"], settings["delay_max"])
             d_max = max(settings["delay_min"], settings["delay_max"])
@@ -365,7 +472,7 @@ def main():
             if cancelled:
                 app_state = "MENU"
             else:
-                beep(300, 3000)
+                beep(800)
                 app_state = "RUNNING"
                 
         elif app_state == "RUNNING":
@@ -397,8 +504,8 @@ def main():
                 # Only apply rest if we are actually doing multiple configured reps
                 if rep > 0 and settings["par_reps"] > 1:
                     clear_screen()
-                    draw_text(f"REST: {settings['par_rest']}s", 20, 40, COLOR_READY)
-                    draw_text(f"Next: Rep {rep+1}", 20, 80, COLOR_TEXT)
+                    draw_text(f"REST: {settings['par_rest']}s", 20, 40, get_ready_color())
+                    draw_text(f"Next: Rep {rep+1}", 20, 80, get_text_color())
                     
                     start_rest = ticks_ms()
                     rest_ms = int(settings["par_rest"] * 1000)
@@ -409,25 +516,23 @@ def main():
                         sleep(0.05)
                         
                     if not running: break
-                    beep(300, 3000) # GO beep again for the next rep!
+                    beep(1000) # GO beep again for the next rep!
                 
                 # --- START OF ACTIVE REP ---
                 clear_screen()
                 
-                # Only show REP text if par settings are active
                 # Only show REP text if par settings are active
                 if settings["par_time"] > 0 or settings["par_reps"] > 0 or settings["par_shots"] > 0:
                     rep_str = f"REP {rep+1}/{settings['par_reps']}"
                     # 8-9 chars -> 128-144px width. Let's say 128px. Center = (320-128)/2 = 96
                     rep_w = len(rep_str) * 16
                     rep_x = (320 - rep_w) // 2
-                    draw_text(rep_str, rep_x, 5, COLOR_READY)
-                # "GO, GO, GO!" is 11 chars * 16px width = 176px. Center X = (320 - 176) / 2 = 72
-                draw_text("GO, GO, GO!", 72, 45, COLOR_GO)
+                    draw_text(rep_str, rep_x, 5, get_ready_color())
                 
                 start_time = ticks_ms()
                 shot_count = 0
                 last_shot_time = 0
+                last_display_time = -1 # Used to track when we should redraw the timer
                 
                 bg_noise_level = 0
                 bg_history = [0] * BACKGROUND_SAMPLES
@@ -439,6 +544,20 @@ def main():
                 while running and not rep_finished:
                     current_time = ticks_diff(ticks_ms(), start_time)
                     
+                    # --- Live Timer Display on LCD ---
+                    # We only update the display every 10ms (1/100th second) to prevent extreme flickering
+                    display_val = current_time // 10 
+                    if display_val != last_display_time:
+                        last_display_time = display_val
+                        time_str = f"{current_time/1000:.2f}"
+                        # Center the live timer display (approx. 5 chars -> 80px)
+                        timer_x = (320 - (len(time_str) * 16)) // 2
+                        
+                        # We only clear the specific rect where the timer draws to minimize flicker
+                        # 40px down, 100 wide, 35 high
+                        tft.fill_rect((320 - 120) // 2, 40, 120, 35, get_bg_color())
+                        draw_text(time_str, timer_x, 40, get_text_color())
+
                     # Stop via ANY Button Press
                     act = get_button_action()
                     if act != 0:
@@ -447,7 +566,10 @@ def main():
                         
                     # Check Par Time Beep
                     if par_time_ms > 0 and current_time >= par_time_ms and not par_beeped:
-                        beep(500, 3000)
+                        # Only beep Par Time if we aren't about to finish the entire session.
+                        # If this is the last rep, the double beep at the end will signify completion.
+                        if rep < reps_to_run - 1:
+                            beep(300)
                         par_beeped = True
                         
                         # If Par Shots is OFF (0), reaching Par Time completes the Session string
@@ -491,10 +613,6 @@ def main():
                     if mic_shot_detected:
                        shot_count += 1
                        
-                       # Erase "GO, GO, GO!" on the very first shot
-                       if shot_count == 1:
-                           tft.fill_rect(72, 45, 176, 32, COLOR_BG)
-                           
                        split_time = ticks_diff(current_time, last_shot_time) if shot_count > 1 else 0
                        last_shot_time = current_time
                        
@@ -503,7 +621,7 @@ def main():
                        
                        msg = f"#{shot_count}: {last_shot_time/1000:.2f}s"
                        split_str = f"Sp: {split_time/1000:.2f}s" if shot_count > 1 else ""
-                       print(f"Shot! Rep {rep+1} | {msg} | Peak: {max_val} | Thresh: {get_energy_threshold()}")
+                       print(f"Shot detected! Time: {last_shot_time/1000:.2f}s | Rep {rep+1} | Peak: {max_val} | Thresh: {get_energy_threshold()}")
                        
                        # Center calculations for live shot info
                        msg_w = len(msg) * 16
@@ -513,11 +631,11 @@ def main():
                        spl_x = (320 - spl_w) // 2
                        
                        # Clear the specific drawing area before drawing new text
-                       tft.fill_rect(0, 80, 320, 80, COLOR_BG)
+                       tft.fill_rect(0, 80, 320, 80, get_bg_color())
                        
-                       tft.text(font, msg, msg_x, 80, COLOR_TEXT, COLOR_BG)
+                       tft.text(font, msg, msg_x, 80, get_text_color(), get_bg_color())
                        if split_str:
-                           tft.text(font, split_str, spl_x, 120, COLOR_ACCENT, COLOR_BG)
+                           tft.text(font, split_str, spl_x, 120, get_accent_color(), get_bg_color())
                        
                        if mic_working:
                            for _ in range(3): audio_in.readinto(mic_buffer) 
@@ -529,6 +647,12 @@ def main():
                     
                     sleep(0.01)
 
+            if running:
+                # Session completed normally
+                beep(200)
+                sleep(0.2)
+                beep(200)
+
             app_state = "REVIEW"
 
         elif app_state == "REVIEW":
@@ -539,18 +663,18 @@ def main():
                 s_tot_count, _, _, s_tot_time, _ = shot_history[-1]
                 
                 # "--- RESULTS ---" (15 chars) = 240px. Center = 40.
-                draw_text("--- RESULTS ---", 40, 0, COLOR_READY)
+                draw_text("--- RESULTS ---", 40, 0, get_ready_color())
                 
                 if settings["par_time"] > 0 or settings["par_reps"] > 0 or settings["par_shots"] > 0:
                      max_rep = shot_history[-1][2]
-                     draw_text(f"Reps: {max_rep}", 10, 45, COLOR_READY)
-                     draw_text(f"Shots: {s_tot_count}", 10, 85, COLOR_TEXT)
+                     draw_text(f"Reps: {max_rep}", 10, 45, get_ready_color())
+                     draw_text(f"Shots: {s_tot_count}", 10, 85, get_text_color())
                 else:
-                     draw_text(f"Shots: {s_tot_count}", 10, 45, COLOR_TEXT)
-                     draw_text(f"Total: {s_tot_time/1000:.2f}s", 10, 85, COLOR_GO)
+                     draw_text(f"Shots: {s_tot_count}", 10, 45, get_text_color())
+                     draw_text(f"Total: {s_tot_time/1000:.2f}s", 10, 85, get_go_color())
                      
                 # "SEL:Exit  SCR:Split" (19 chars) = 304px. Center X = 8, Bottom Y = 136
-                draw_text("SEL:Exit  SCR:Split", 8, 136, COLOR_READY)
+                draw_text("SEL:Exit  SCR:Split", 8, 136, get_ready_color())
                 
                 # Wait for interaction
                 while True:
@@ -574,7 +698,7 @@ def main():
                     # E.g. "Shot 1/5" is 8 chars = 128px. Center = (320-128)/2 = 96
                     shot_w = len(shot_text) * 16
                     shot_x = (320 - shot_w) // 2
-                    draw_text(shot_text, shot_x, 5, COLOR_READY)
+                    draw_text(shot_text, shot_x, 5, get_ready_color())
                     
                     if settings["par_time"] > 0 or settings["par_reps"] > 0 or settings["par_shots"] > 0:
                         rep_total = 0
@@ -582,29 +706,54 @@ def main():
                             if shot[2] == s_rep:
                                 rep_total = shot[3]
                                 break
-                        draw_text(f"Rep: {s_rep} Tot: {rep_total/1000:.2f}s", 10, 35, COLOR_READY)
+                        draw_text(f"Rep: {s_rep} Tot: {rep_total/1000:.2f}s", 10, 35, get_ready_color())
                     
                     # 2. Show Total time in first line
-                    draw_text(f"Tm: {s_total/1000:.2f}s", 10, 65, COLOR_TEXT)
+                    draw_text(f"Tm: {s_total/1000:.2f}s", 10, 65, get_text_color())
                     
                     # 3. Show split shot segment in second line, and split time in third line
                     if s_count > 1:
-                        draw_text(f"Sp. Shot: {s_count-1}-{s_count}", 10, 95, COLOR_TEXT)
-                        draw_text(f"Sp.tm: {s_split/1000:.2f}s", 10, 125, COLOR_ACCENT)
+                        draw_text(f"Sp. Shot: {s_count-1}-{s_count}", 10, 95, get_text_color())
+                        draw_text(f"Sp.tm: {s_split/1000:.2f}s", 10, 125, get_accent_color())
                     else:
-                        draw_text("Sp. Shot: --", 10, 95, COLOR_TEXT)
-                        draw_text("Sp.tm: ----", 10, 125, COLOR_ACCENT)
+                        draw_text("Sp. Shot: --", 10, 95, get_text_color())
+                        draw_text("Sp.tm: ----", 10, 125, get_accent_color())
                     
                     # Bottom labels
                     # There are 18 characters here. Center is 16.
-                    draw_text("SCR:Nx SEL:Bk / Ex", 16, 150, COLOR_BG)
+                    draw_text("SCR:Nx SEL:Bk / Ex", 16, 150, get_bg_color())
                         
                     while True:
                         act = get_button_action()
                         if act == 1: # Next (Scroll button)
                             idx = (idx + 1)
                             if idx >= len(shot_history):
-                                app_state = "MENU"
+                                # Instead of exiting immediately, go to a post-review menu
+                                post_review_menu = ["Send", "Back", "Exit"]
+                                p_idx = 0
+                                draw_menu(post_review_menu, p_idx)
+                                
+                                while True:
+                                    p_act = get_button_action()
+                                    if p_act == 1: # Scroll
+                                        p_idx = (p_idx + 1) % len(post_review_menu)
+                                        draw_menu(post_review_menu, p_idx)
+                                    elif p_act == 2 or p_act == 3: # Select
+                                        p_sel = post_review_menu[p_idx]
+                                        if p_sel == "Send":
+                                            # Placeholder for send logic
+                                            clear_screen()
+                                            draw_text("Sending...", 80, 80, get_ready_color())
+                                            sleep(1)
+                                            draw_menu(post_review_menu, p_idx)
+                                        elif p_sel == "Back":
+                                            # Go back to viewing the last shot
+                                            idx = len(shot_history) - 1
+                                            break
+                                        elif p_sel == "Exit":
+                                            app_state = "MENU"
+                                            break
+                                    sleep(0.05)
                             break
                         elif act == 2: # Back (Short Select)
                             if idx > 0:
@@ -617,11 +766,18 @@ def main():
                         
                     if app_state == "MENU": break
             else:
-                draw_text("STOPPED", 100, 200, COLOR_ACCENT)
+                draw_text("STOPPED", 100, 200, get_accent_color())
                 sleep(2)
                 app_state = "MENU"
                 
         sleep(0.1)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("CRASHED:", e)
+        # Prevent immediately dropping to REPL without showing something if possible
+        try:
+            draw_text("ERROR", 10, 10, get_accent_color())
+        except: pass
