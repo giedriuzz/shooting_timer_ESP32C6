@@ -10,4 +10,7 @@ neeed to show: Total Shots, Total Reps
 
 # [x] atlikta
 in review mode if Par Rp > 0:
-    add in second line in line efter Rep: total time of Rep shots. 
+    add in second line in line efter Rep: total time of Rep shots.
+
+# [ ] atlikta
+when device goes to sleep mode and immediately wakes up. Device should stay in sleep mode. Devise powered from power bank

@@ -21,7 +21,7 @@ if hasattr(machine, 'I2S'):
 else:
     HAS_I2S = False
 
-from time import sleep, ticks_ms, ticks_diff
+from time import sleep, ticks_ms, ticks_diff, ticks_us
 import random
 import network
 import struct
@@ -48,8 +48,7 @@ BACKGROUND_SAMPLES = 10
 # Default Session Settings
 settings = {
     "brightness": 32768,       # 50% PWM Duty
-    "delay_min": 2,            # Random start min (seconds)
-    "delay_max": 6,            # Random start max (seconds)
+    "start_delay_mode": 0,     # 0=Immediate, 1-10=Fixed Seconds, 11=Random 1-10s
     "par_time": 0.0,           # 0 = Off, >0 = Par Time (seconds, 0.5s increments)
     "par_reps": 0,            # Number of Repetitions / Sessions
     "par_rest": 0,          # Rest time between string repetitions (seconds)
@@ -58,7 +57,10 @@ settings = {
     "sensitivity": 800000,     # Acoustic threshold
     "buzzer_vol": 50,          # 0-100% volume
     "theme": 0,                # 0 = Dark, 1 = Light
-    "sleep_time": 5,           # Inactivity timeout to Deep Sleep (minutes, 0 = Off)
+    "sleep_time": 5 ,          # 0 = Off (Disabled by default to prevent reboot loops)
+    "bluetooth": 0,            # 0 = Off, 1 = On
+    "rand_delay_min": 1,       # Minimum random delay in seconds
+    "rand_delay_max": 5,       # Maximum random delay in seconds
 }
 
 def get_energy_threshold():
@@ -110,7 +112,7 @@ audio_in = None
 mic_buffer = None
 mic_working = False
 
-# --- Hardware Setup ---
+# Disable networking permanently to save power
 try:
     network.WLAN(network.STA_IF).active(False)
     network.WLAN(network.AP_IF).active(False)
@@ -174,7 +176,8 @@ def beep(duration_ms=200):
         buzzer.value(1) # Turn OFF
 
 def enter_deep_sleep():
-    global tft, backlight_pwm
+    global tft, backlight_pwm, audio_in
+    print("[SLEEP] Entering sleep sequence...")
     clear_screen()
     draw_text("SLEEPING...", 80, 100, get_accent_color())
     for _ in range(3):
@@ -183,37 +186,86 @@ def enter_deep_sleep():
     sleep(0.5)
     
     # Turn off backlight and screen
-    if tft: tft.fill(st7789.BLACK)
+    if tft: 
+        print("[SLEEP] Turning off display...")
+        tft.fill(st7789.BLACK)
+    
+    # Deinitialize peripherals to prevent crashes during lightsleep
+    print("[SLEEP] Deinitializing PWM...")
     try:
         backlight_pwm.duty_u16(0)
-    except: pass
+        backlight_pwm.deinit()
+    except Exception as e:
+        print("[SLEEP] PWM deinit error:", e)
+
+    if HAS_I2S and mic_working and audio_in:
+        print("[SLEEP] Deinitializing I2S microphone...")
+        try:
+            audio_in.deinit()
+        except Exception as e:
+            print("[SLEEP] I2S deinit error:", e)
+
+    print("[SLEEP] Disabling networking...")
+    try:
+        import network
+        network.WLAN(network.STA_IF).active(False)
+        network.WLAN(network.AP_IF).active(False)
+    except Exception as e: 
+        print("[SLEEP] Network disable error:", e)
     
-    # Configure wake up from Select Button (Pin 5) pulling LOW
-    wake_pin = Pin(BTN_SELECT_PIN, Pin.IN, Pin.PULL_UP)
-    
-    # Generic machine API (ESP32-C3, ESP32-C6, etc)
-    if WAKE_LOW_FLAG is not None:
-         wake_pin.irq(handler=lambda t: None, trigger=Pin.IRQ_FALLING, wake=machine.SLEEP)
-            
-    # Enter Light Sleep (behaves like deep sleep on C6 but wakes cleanly from GPIO)
-    machine.lightsleep()
-    
-    # Disable the IRQ immediately so it doesn't fire repeatedly
-    if WAKE_LOW_FLAG is not None:
-         wake_pin.irq(handler=None, wake=0)
+    # To guarantee stability on ESP32-C6, we will use a "Soft Sleep". 
+    # We leave the CPU awake but in a slow polling loop, which still saves power 
+    # since we've disabled the high-drain peripherals (TFT, WiFi, I2S).
+    print("[SLEEP] Entering Soft Sleep polling loop...")
+    while True:
+        # Check if button is pressed
+        if btn_select.value() == 0:
+            # Debounce
+            sleep(0.05)
+            if btn_select.value() == 0:
+                print("[WAKE] Waking from Soft Sleep!")
+                break
+        
+        # Slow polling loop to keep CPU usage minimal
+        sleep(0.1)
+
+    print("[WAKE] Waiting for button release...")
+    while btn_select.value() == 0:
+        sleep(0.05)
+        
+    print("[WAKE] Restoring display...")
     # When we wake up, restore display color and backlight
     if tft:
         try:
+            # The ST7789 driver doesn't have a specific wake command in this library
+            # So we re-init the whole config to ensure it turns back on properly
+            global tft
+            tft = tft_config.config(tft_config.WIDE)
+            tft.rotation(1)
             tft.fill(get_bg_color())
         except Exception as e:
-            print("Wake TFT error:", e)
+            print("[WAKE] Wake TFT error:", e)
 
+    print("[WAKE] Restoring backlight PWM...")
     try:
         backlight_pwm = PWM(Pin(BACKLIGHT_PIN))
         backlight_pwm.freq(1000)
         backlight_pwm.duty_u16(settings["brightness"])
     except Exception as e:
-        print("Wake PWM error:", e)
+        print("[WAKE] Wake PWM error:", e)
+
+    print("[WAKE] Restoring I2S Microphone...")
+    if HAS_I2S and mic_working:
+        try:
+            audio_in = I2S(0, 
+                   sck=Pin(I2S_SCK_PIN), 
+                   ws=Pin(I2S_WS_PIN), 
+                   sd=Pin(I2S_SD_PIN), 
+                   mode=I2S.RX, bits=32, format=I2S.MONO, rate=16000, ibuf=4096)
+        except Exception as e:
+            print("[WAKE] Wake I2S error:", e)
+            
+    print("[WAKE] Wake sequence complete.")
 
 def get_button_action():
     """
@@ -221,7 +273,8 @@ def get_button_action():
     0 = None
     1 = Scroll (Short Press Btn 1)
     2 = Select (Short Press Btn 2)
-    3 = Back/Long Select (Long Press Btn 2)
+    3 = Back/Long Select (Long Press Btn 2) -> 400ms - 3000ms
+    4 = Ultra Long Select (Extra Long Press Btn 2) -> 3000ms+
     """
     global last_activity_time
     
@@ -239,18 +292,21 @@ def get_button_action():
             start_t = ticks_ms()
             while btn_select.value() == 0: pass # Wait release
             duration = ticks_diff(ticks_ms(), start_t)
-            if duration > 800:
+            if duration > 3000:
+                return 4 # Ultra-Long press
+            elif duration > 400:
                 return 3 # Long press
             return 2 # Short press
     return 0
 
 
 # --- Menu Definitions ---
-MAIN_MENU = ["START", "Settings"]
+MAIN_MENU = [] # Dynamically updated based on shot history. Starts completely empty.
+# SETTINGS_MENU, SETUP_MENU, CALIB_MENU, SYS_MENU are primarily static bases
 SETTINGS_MENU = ["Setup", "Calibrate", "System", "<- Back"]
-SETUP_MENU = ["Delay Min", "Delay Max", "Par Time", "Par Reps", "Par Rest", "Par Shots", "Mode", "<- Back"]
+SETUP_MENU_BASE = ["Start Delay", "Par Time", "Par Reps", "Par Rest", "Par Shots", "Mode", "<- Back"]
 CALIB_MENU = ["Sensitivity", "Buzzer Vol", "<- Back"]
-SYS_MENU = ["Brightness", "Theme", "Sleep Time", "<- Back"]
+SYS_MENU = ["Brightness", "Theme", "Sleep Time", "Bluetooth", "<- Back"]
 
 def draw_menu(items, selected_idx):
     clear_screen()
@@ -258,27 +314,38 @@ def draw_menu(items, selected_idx):
     is_main = (items == MAIN_MENU)
     
     if is_main:
-        # [ ] MENU ALIGNMENT: Adjust START_X, START_Y to center the START text
-        # Screen is 320x172 (landscape). Font is 16x32. ">START" = 96px, so X = 112
-        START_X = 112 
-        START_Y = 40
+        # User requested the screen to be blank on start. 
+        # So we no longer draw "START" statically at the top.
         
-        # [ ] MENU ALIGNMENT: Adjust SETTINGS_X, SETTINGS_Y to set spacing from START
-        # ">Settings" = 144px, so X = 88
-        SETTINGS_X = 88
-        SETTINGS_Y = 100
-        
-        for i, text in enumerate(items):
-            color = get_sel_color() if i == selected_idx else get_text_color()
-            prefix = ">" if i == selected_idx else " "
-            
-            if text == "START":
-                draw_text(f"{prefix}{text}", START_X, START_Y, color)
-            elif text == "Settings":
-                draw_text(f"{prefix}{text}", SETTINGS_X, SETTINGS_Y, color)
+        # Draw the actual menu items below
+        y = 60
+        x_offset = 30
+        y_step = 40
+        if len(items) > 0:
+            for i, text in enumerate(items):
+                color = get_sel_color() if i == selected_idx else get_text_color()
+                prefix = ">" if i == selected_idx else " "
+                draw_text(f"{prefix}{text}", x_offset, y, color)
+                y += y_step
+        else:
+            draw_text("Press START", 72, 60, get_text_color())
+            draw_text("to start !", 80, 100, get_text_color())
 
-        if settings["par_time"] > 0:
-            draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 205, get_ready_color())
+        # Delay Mode Indicator
+        if settings["start_delay_mode"] == 0:
+            delay_char = "Imm"
+        elif settings["start_delay_mode"] <= 10:
+            delay_char = "Del"
+        else:
+            delay_char = "Rnd"
+        draw_text(delay_char, 5, 5, get_text_color())
+
+        if settings.get("bluetooth", 0) == 1:
+            draw_text("BL", 300, 5, get_text_color())
+
+        """ if len(items) > 0:
+            if settings["par_time"] > 0:
+                draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 140, get_ready_color()) """
             
         return # Main menu drawn, skip generic drawing
     
@@ -302,13 +369,22 @@ def draw_menu(items, selected_idx):
         prefix = ">" if i == selected_idx else " "
         
         text = items[i]
-        if text == "Delay Min": text = f"St.Min: {settings['delay_min']}s"
-        elif text == "Delay Max": text = f"St.Max: {settings['delay_max']}s"
+        if text == "Start Delay":
+            val = settings['start_delay_mode']
+            if val == 0:
+                text = "Delay: Immed"
+            elif val <= 10:
+                text = f"Delay: {val}s"
+            else:
+                text = "Delay: Random"
+        elif text == "Rnd Min": text = f"Rnd Min: {settings['rand_delay_min']}s"
+        elif text == "Rnd Max": text = f"Rnd Max: {settings['rand_delay_max']}s"
         elif text == "Par Time": text = f"Par Tm: {settings['par_time']:.1f}s"
         elif text == "Par Reps": text = f"Par Rp: {settings['par_reps']}"
         elif text == "Par Rest": text = f"Par Rt: {settings['par_rest']:.1f}s"
         elif text == "Par Shots": text = f"Par Sht:{settings['par_shots'] if settings['par_shots']>0 else 'Off'}"
         elif text == "Mode": text = f"Mode:{'Dry' if settings['mode']==1 else 'Live'}"
+        elif text == "Bluetooth": text = f"BT:{'On' if settings.get('bluetooth', 0)==1 else 'Off'}"
         elif text == "Sensitivity": 
             mapped_val = int(settings['sensitivity'] / 100000)
             text = f"Sens: {mapped_val}"
@@ -320,9 +396,6 @@ def draw_menu(items, selected_idx):
         draw_text(f"{prefix}{text}", x_offset, y, color)
         y += y_step
 
-    if is_main and settings["par_time"] > 0:
-        draw_text(f"PAR: {settings['par_time']:.1f}s", 5, 205, get_ready_color())
-
 # --- State Machine App ---
 def main():
     global app_state, menu_idx, current_menu, shot_history, last_activity_time
@@ -333,9 +406,6 @@ def main():
     clear_screen()
     draw_text("G electronic", 70, 70, get_accent_color()) # [ ] Sureguliuoti užrašo G-electronic lygiavimą
     sleep(3)
-    clear_screen()
-    draw_text("Shooting timer", 50, 70, get_ready_color()) # [ ] Sureguliuoti užrašo "Shooting timer" lygiavimą
-    sleep(2)
     beep(100)
     
     app_state = "MENU"
@@ -344,10 +414,28 @@ def main():
 
     while True:
         if app_state == "MENU":
-            if current_menu == "MAIN": menu_list = MAIN_MENU
+            if current_menu == "MAIN": 
+                global MAIN_MENU
+                if len(shot_history) > 0:
+                    MAIN_MENU = ["Review"]
+                else:
+                    MAIN_MENU = []
+                menu_list = MAIN_MENU
+                if menu_idx >= len(menu_list): menu_idx = 0
             elif current_menu == "SETTINGS": menu_list = SETTINGS_MENU
-            elif current_menu == "SETUP": menu_list = SETUP_MENU
+            elif current_menu == "SETUP": 
+                # Rebuild setup menu dynamically based on Random mode
+                menu_list = SETUP_MENU_BASE.copy()
+                if settings["start_delay_mode"] > 10:
+                    menu_list.insert(1, "Rnd Min")
+                    menu_list.insert(2, "Rnd Max")
+                if menu_idx >= len(menu_list): menu_idx = 0
             elif current_menu == "CALIB": menu_list = CALIB_MENU
+            elif current_menu == "REV_OPT":
+                menu_list = ["Splits", "Clear"]
+                if settings.get("bluetooth", 0) == 1:
+                    menu_list.append("Send BT")
+                menu_list.append("<- Back")
             else: menu_list = SYS_MENU
                 
             draw_menu(menu_list, menu_idx)
@@ -369,86 +457,124 @@ def main():
                     
                 act = get_button_action()
                 if act == 1: # SCROLL
-                    menu_idx = (menu_idx + 1) % len(menu_list)
+                    if len(menu_list) > 0:
+                        menu_idx = (menu_idx + 1) % len(menu_list)
                     draw_menu(menu_list, menu_idx)
                 
-                elif act == 3: # LONG SELECT -> Back to main
-                    if current_menu == "MAIN": pass
-                    elif current_menu == "SETTINGS": 
-                        current_menu = "MAIN"; menu_idx = 0; draw_menu(MAIN_MENU, menu_idx)
-                    else: 
-                        current_menu = "SETTINGS"; menu_idx = 0; draw_menu(SETTINGS_MENU, menu_idx)
-                    
-                elif act == 2: # SHORT SELECT -> Edit / Enter
-                    selectedSTR = menu_list[menu_idx]
+                elif act == 2: # SHORT SELECT
+                    if len(menu_list) == 0:
+                        selectedSTR = ""
+                    else:
+                        selectedSTR = menu_list[menu_idx]
                     
                     if current_menu == "MAIN":
-                        if "START" in selectedSTR: app_state = "STANDBY"
-                        elif "Settings" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0
+                        # In the completely revamped MAIN menu, Short Select ALWAYS starts the timer
+                        app_state = "STANDBY"
                     
                     elif current_menu == "SETTINGS":
-                        if "Setup" in selectedSTR: current_menu = "SETUP"; menu_idx = 0
-                        elif "Calibrate" in selectedSTR: current_menu = "CALIB"; menu_idx = 0
-                        elif "System" in selectedSTR: current_menu = "SYS"; menu_idx = 0
-                        elif "Back" in selectedSTR: current_menu = "MAIN"; menu_idx = 0
+                        if "Back" in selectedSTR: current_menu = "MAIN"; menu_idx = 0; break
+                    
+                    elif current_menu == "REV_OPT":
+                        if "Clear" in selectedSTR:
+                            shot_history.clear()
+                            current_menu = "MAIN"
+                            menu_idx = 0
+                            break
+                        elif "Send BT" in selectedSTR:
+                            # Placeholder for Bluetooth logic
+                            draw_text("Sending...", 80, 80, get_accent_color())
+                            sleep(1)
+                            draw_menu(menu_list, menu_idx)
+                        elif "Back" in selectedSTR:
+                            current_menu = "MAIN"; menu_idx = 0; break
                     
                     elif current_menu == "SETUP":
-                        if "Back" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0
-                        elif "Delay Min" in selectedSTR: 
-                            settings["delay_min"] = (settings["delay_min"] % 10) + 1
-                            if settings["delay_max"] < settings["delay_min"]: 
-                                settings["delay_max"] = settings["delay_min"]
-                        elif "Delay Max" in selectedSTR: 
-                            settings["delay_max"] = (settings["delay_max"] % 10) + 1
-                            if settings["delay_max"] < settings["delay_min"]:
-                                settings["delay_max"] = settings["delay_min"]
-                        elif "Par Time" in selectedSTR: 
+                        if "Start Delay" in selectedSTR:
+                            settings["start_delay_mode"] = (settings["start_delay_mode"] + 1) % 12
+                            # If we switch to/from random mode, break to re-render the list immediately
+                            if settings["start_delay_mode"] == 11 or settings["start_delay_mode"] == 0:
+                                break
+                        elif "Rnd Min" in selectedSTR:
+                            settings["rand_delay_min"] += 1
+                            if settings["rand_delay_min"] >= settings["rand_delay_max"]:
+                                settings["rand_delay_min"] = 1
+                        elif "Rnd Max" in selectedSTR:
+                            settings["rand_delay_max"] += 1
+                            if settings["rand_delay_max"] > 15:
+                                settings["rand_delay_max"] = settings["rand_delay_min"] + 1
+                        elif "Par Time" in selectedSTR:
                             settings["par_time"] += 0.5
                             if settings["par_time"] > 30.0: settings["par_time"] = 0.0
-                        elif "Par Reps" in selectedSTR: settings["par_reps"] = (settings["par_reps"] % 10) + 1
-                        elif "Par Rest" in selectedSTR: 
+                        elif "Par Reps" in selectedSTR:
+                            settings["par_reps"] += 1
+                            if settings["par_reps"] > 10: settings["par_reps"] = 1
+                        elif "Par Rest" in selectedSTR:
                             settings["par_rest"] += 0.5
-                            if settings["par_rest"] > 30.0: settings["par_rest"] = 1.0
-                        elif "Par Shots" in selectedSTR: settings["par_shots"] = (settings["par_shots"] + 1) % 20
-                        elif "Mode" in selectedSTR: settings["mode"] = 1 if settings["mode"] == 0 else 0
-                        
+                            if settings["par_rest"] > 15.0: settings["par_rest"] = 1.0
+                        elif "Par Shots" in selectedSTR:
+                            settings["par_shots"] += 1
+                            if settings["par_shots"] > 20: settings["par_shots"] = 0
+                        elif "Mode" in selectedSTR:
+                            settings["mode"] = 1 if settings["mode"] == 0 else 0
+                        elif "Back" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0; break
+                        draw_menu(menu_list, menu_idx)
+
                     elif current_menu == "CALIB":
-                        if "Back" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0
-                        elif "Sensitivity" in selectedSTR: 
-                            # Range 1 to 20 (mapped to 100k -> 2M)
-                            mapped = int(settings["sensitivity"] / 100000)
-                            mapped = (mapped % 20) + 1
-                            settings["sensitivity"] = mapped * 100000
-                        elif "Buzzer Vol" in selectedSTR: settings["buzzer_vol"] = (settings["buzzer_vol"] + 25) % 125
-                        
+                        if "Sensitivity" in selectedSTR:
+                            val = int(settings["sensitivity"] / 100000)
+                            val = (val + 1) % 16
+                            if val == 0: val = 1
+                            settings["sensitivity"] = val * 100000
+                        elif "Buzzer Vol" in selectedSTR:
+                            settings["buzzer_vol"] = (settings["buzzer_vol"] + 10) % 110
+                        elif "Back" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0; break
+                        draw_menu(menu_list, menu_idx)
+
                     elif current_menu == "SYS":
-                        if "Back" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0
-                        elif "Brightness" in selectedSTR: 
-                            pct = int(settings["brightness"]/65535*100)
-                            pct = (pct + 25) % 125
-                            if pct == 0: pct = 10
-                            settings["brightness"] = int((pct / 100) * 65535)
+                        if "Brightness" in selectedSTR:
+                            cur_pct = int(settings["brightness"] / 65535 * 100)
+                            cur_pct = (cur_pct + 10) % 110
+                            if cur_pct == 0: cur_pct = 10
+                            settings["brightness"] = int((cur_pct / 100) * 65535)
                             try:
                                 backlight_pwm.duty_u16(settings["brightness"])
                             except: pass
                         elif "Theme" in selectedSTR:
                             settings["theme"] = 1 if settings["theme"] == 0 else 0
                         elif "Sleep Time" in selectedSTR:
-                            # 0 (Off), 1, 2, 5, 10, 15, 30
-                            times = [0, 1, 2, 5, 10, 15, 30]
-                            try:
-                                curr_idx = times.index(settings["sleep_time"])
-                            except:
-                                curr_idx = 3 # default 5
-                            settings["sleep_time"] = times[(curr_idx + 1) % len(times)]
-                            
-                    if app_state == "MENU": # Redraw menu after changes
-                        if current_menu == "MAIN": menu_list = MAIN_MENU
-                        elif current_menu == "SETTINGS": menu_list = SETTINGS_MENU
-                        elif current_menu == "SETUP": menu_list = SETUP_MENU
-                        elif current_menu == "CALIB": menu_list = CALIB_MENU
-                        else: menu_list = SYS_MENU
+                            settings["sleep_time"] += 1
+                            if settings["sleep_time"] > 60: settings["sleep_time"] = 0
+                        elif "Bluetooth" in selectedSTR:
+                            settings["bluetooth"] = 1 if settings.get("bluetooth", 0) == 0 else 0
+                        elif "Back" in selectedSTR: current_menu = "SETTINGS"; menu_idx = 0; break
                         draw_menu(menu_list, menu_idx)
+                        
+                elif act == 3: # LONG SELECT
+                    if current_menu == "MAIN": 
+                        if len(menu_list) > 0:
+                            # In the MAIN menu, Long Select enters the currently highlighted sub-menu (Review)
+                            selectedSTR = menu_list[menu_idx]
+                            if "Review" in selectedSTR:
+                                current_menu = "REV_OPT"; menu_idx = 0; break
+                    elif current_menu == "SETTINGS": 
+                        selectedSTR = menu_list[menu_idx]
+                        if "Setup" in selectedSTR: current_menu = "SETUP"; menu_idx = 0; break
+                        elif "Calibrate" in selectedSTR: current_menu = "CALIB"; menu_idx = 0; break
+                        elif "System" in selectedSTR: current_menu = "SYS"; menu_idx = 0; break
+                        elif "Back" in selectedSTR: current_menu = "MAIN"; menu_idx = 0; break
+                    elif current_menu == "REV_OPT":
+                        selectedSTR = menu_list[menu_idx]
+                        if "Splits" in selectedSTR: app_state = "REVIEW"; break
+                        elif "Back" in selectedSTR: current_menu = "MAIN"; menu_idx = 0; break
+                    else: 
+                        current_menu = "SETTINGS"; menu_idx = 0; break
+
+                elif act == 4: # ULTRA LONG SELECT (>3s)
+                    if current_menu == "MAIN":
+                        # Directly enter SETTINGS from anywhere on the MAIN menu
+                        current_menu = "SETTINGS"; menu_idx = 0; break
+                        
+                if app_state != "MENU": break
                 
                 sleep(0.05)
 
@@ -456,9 +582,16 @@ def main():
             clear_screen()
             draw_text("STANDBY...", 80, 100, get_ready_color())
             
-            d_min = min(settings["delay_min"], settings["delay_max"])
-            d_max = max(settings["delay_min"], settings["delay_max"])
-            delay_ms = random.randint(d_min * 1000, d_max * 1000)
+            # Determine actual delay based on start_delay_mode
+            d_mode = settings["start_delay_mode"]
+            if d_mode == 0:
+                delay_ms = 0
+            elif d_mode <= 10:
+                delay_ms = d_mode * 1000
+            else:
+                # Seed heavily entropy-based microsecond timing of the user's button press
+                random.seed(ticks_us())
+                delay_ms = random.randint(settings["rand_delay_min"] * 1000, settings["rand_delay_max"] * 1000)
             
             # Cancellable wait loop
             start_wait = ticks_ms()
@@ -659,112 +792,113 @@ def main():
             if len(shot_history) > 0:
                 clear_screen()
                 
-                # Calculate total time (time of the last shot)
-                s_tot_count, _, _, s_tot_time, _ = shot_history[-1]
+                # We separate out the review grouping by REP
+                # Form a dictionary or list of sub-lists grouped by Rep
+                reps_data = {}
+                for shot in shot_history:
+                    # shot = (global_shot_count, rep_shot_count, rep_num, total_time, split_time)
+                    r_num = shot[2]
+                    if r_num not in reps_data:
+                        reps_data[r_num] = []
+                    reps_data[r_num].append(shot)
                 
-                # "--- RESULTS ---" (15 chars) = 240px. Center = 40.
+                sorted_reps = sorted(list(reps_data.keys()))
+                
+                # "--- RESULTS ---"
                 draw_text("--- RESULTS ---", 40, 0, get_ready_color())
                 
-                if settings["par_time"] > 0 or settings["par_reps"] > 0 or settings["par_shots"] > 0:
-                     max_rep = shot_history[-1][2]
-                     draw_text(f"Reps: {max_rep}", 10, 45, get_ready_color())
-                     draw_text(f"Shots: {s_tot_count}", 10, 85, get_text_color())
-                else:
-                     draw_text(f"Shots: {s_tot_count}", 10, 45, get_text_color())
-                     draw_text(f"Total: {s_tot_time/1000:.2f}s", 10, 85, get_go_color())
+                total_shots_all = len(shot_history)
+                draw_text(f"Total Reps: {len(sorted_reps)}", 10, 45, get_ready_color())
+                draw_text(f"Total Shots: {total_shots_all}", 10, 85, get_text_color())
                      
-                # "SEL:Exit  SCR:Split" (19 chars) = 304px. Center X = 8, Bottom Y = 136
-                draw_text("SEL:Exit  SCR:Split", 8, 136, get_ready_color())
+                draw_text("SEL:Exit  SCR:Review", 8, 125, get_ready_color())
                 
-                # Wait for interaction
                 while True:
                     act = get_button_action()
                     if act != 0: break
                     sleep(0.05)
                 
-                # Exit if Select (2) or Long Select (3) was pressed
                 if act == 2 or act == 3: 
                     app_state = "MENU"
                     continue
                 
-                # User hit SCROLL, start reviewing
-                idx = 0
-                while True:
+                # User hit SCROLL, start reviewing rep by rep, shot by shot
+                rep_list_idx = 0
+                while rep_list_idx < len(sorted_reps):
+                    current_rep_num = sorted_reps[rep_list_idx]
+                    rep_shots = reps_data[current_rep_num]
+                    
+                    rep_total_time = rep_shots[-1][3] if rep_shots else 0
+                    
+                    # Show Rep Summary first
                     clear_screen()
-                    s_global_count, s_count, s_rep, s_total, s_split = shot_history[idx]
+                    draw_text(f"--- REP {current_rep_num} ---", 40, 5, get_ready_color())
+                    draw_text(f"Shots: {len(rep_shots)}", 10, 45, get_text_color())
+                    draw_text(f"Time: {rep_total_time/1000:.2f}s", 10, 85, get_go_color())
+                    draw_text("SCR:Splits SEL:Skip", 8, 125, get_text_color())
                     
-                    # 1. Center "Shot N/Total" on top
-                    shot_text = f"Shot {s_global_count}/{len(shot_history)}"
-                    # E.g. "Shot 1/5" is 8 chars = 128px. Center = (320-128)/2 = 96
-                    shot_w = len(shot_text) * 16
-                    shot_x = (320 - shot_w) // 2
-                    draw_text(shot_text, shot_x, 5, get_ready_color())
-                    
-                    if settings["par_time"] > 0 or settings["par_reps"] > 0 or settings["par_shots"] > 0:
-                        rep_total = 0
-                        for shot in reversed(shot_history):
-                            if shot[2] == s_rep:
-                                rep_total = shot[3]
-                                break
-                        draw_text(f"Rep: {s_rep} Tot: {rep_total/1000:.2f}s", 10, 35, get_ready_color())
-                    
-                    # 2. Show Total time in first line
-                    draw_text(f"Tm: {s_total/1000:.2f}s", 10, 65, get_text_color())
-                    
-                    # 3. Show split shot segment in second line, and split time in third line
-                    if s_count > 1:
-                        draw_text(f"Sp. Shot: {s_count-1}-{s_count}", 10, 95, get_text_color())
-                        draw_text(f"Sp.tm: {s_split/1000:.2f}s", 10, 125, get_accent_color())
-                    else:
-                        draw_text("Sp. Shot: --", 10, 95, get_text_color())
-                        draw_text("Sp.tm: ----", 10, 125, get_accent_color())
-                    
-                    # Bottom labels
-                    # There are 18 characters here. Center is 16.
-                    draw_text("SCR:Nx SEL:Bk / Ex", 16, 150, get_bg_color())
-                        
+                    skip_rep_splits = False
                     while True:
                         act = get_button_action()
-                        if act == 1: # Next (Scroll button)
-                            idx = (idx + 1)
-                            if idx >= len(shot_history):
-                                # Instead of exiting immediately, go to a post-review menu
-                                post_review_menu = ["Send", "Back", "Exit"]
-                                p_idx = 0
-                                draw_menu(post_review_menu, p_idx)
-                                
-                                while True:
-                                    p_act = get_button_action()
-                                    if p_act == 1: # Scroll
-                                        p_idx = (p_idx + 1) % len(post_review_menu)
-                                        draw_menu(post_review_menu, p_idx)
-                                    elif p_act == 2 or p_act == 3: # Select
-                                        p_sel = post_review_menu[p_idx]
-                                        if p_sel == "Send":
-                                            # Placeholder for send logic
-                                            clear_screen()
-                                            draw_text("Sending...", 80, 80, get_ready_color())
-                                            sleep(1)
-                                            draw_menu(post_review_menu, p_idx)
-                                        elif p_sel == "Back":
-                                            # Go back to viewing the last shot
-                                            idx = len(shot_history) - 1
-                                            break
-                                        elif p_sel == "Exit":
-                                            app_state = "MENU"
-                                            break
-                                    sleep(0.05)
-                            break
-                        elif act == 2: # Back (Short Select)
-                            if idx > 0:
-                                idx -= 1
-                            break
-                        elif act == 3: # Exit (Long Select)
-                            app_state = "MENU"
-                            break
+                        if act == 1: 
+                            skip_rep_splits = True
+                            break # Skip this rep's splits, go to next rep summary
+                        elif act == 2 or act == 3:
+                            break # Go view splits
                         sleep(0.05)
+                    
+                    if skip_rep_splits:
+                        rep_list_idx += 1
+                        if rep_list_idx >= len(sorted_reps):
+                            app_state = "MENU"
+                        continue
+                    
+                    # Scroll through the specific splits for this Rep
+                    shot_idx = 0
+                    exit_review = False
+                    while shot_idx < len(rep_shots):
+                        clear_screen()
+                        s_global_count, s_count, s_rep, s_total, s_split = rep_shots[shot_idx]
                         
-                    if app_state == "MENU": break
+                        shot_text = f"Rep {s_rep} - #{s_count}/{len(rep_shots)}"
+                        shot_w = len(shot_text) * 16
+                        shot_x = (320 - shot_w) // 2
+                        draw_text(shot_text, shot_x, 5, get_ready_color())
+                        
+                        draw_text(f"Tm: {s_total/1000:.2f}s", 10, 45, get_text_color())
+                        
+                        if s_count > 1:
+                            draw_text(f"St. {s_count-1}-{s_count}: Sp. {s_split/1000:.2f}s", 10, 85, get_ready_color())
+                        else:
+                            draw_text("Sp. Shot: ----", 10, 85, get_accent_color())
+                            
+                        draw_text("SCR:Bk SEL:Nx/Ex", 16, 125, get_text_color())
+                            
+                        while True:
+                            act = get_button_action()
+                            if act == 1: # Next split
+                                shot_idx += 1
+                                break
+                            elif act == 2: # Back
+                                if shot_idx > 0:
+                                    shot_idx -= 1
+                                break
+                            elif act == 3: # Exit review entirely
+                                exit_review = True
+                                break
+                            sleep(0.05)
+                            
+                        if exit_review:
+                            break
+                    
+                    if exit_review:
+                         app_state = "MENU"
+                         break
+                    
+                    # Reached end of splits for this Rep, go to next Rep
+                    rep_list_idx += 1
+                    
+                app_state = "MENU"
             else:
                 draw_text("STOPPED", 100, 200, get_accent_color())
                 sleep(2)
